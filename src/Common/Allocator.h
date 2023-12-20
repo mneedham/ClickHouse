@@ -74,7 +74,7 @@ public:
         checkSize(size);
         auto trace = CurrentMemoryTracker::alloc(size);
         void * ptr = allocNoTrack(size, alignment);
-        trace.onAlloc(ptr, size);
+        trace.onAlloc(ptr, size, size);
         return ptr;
     }
 
@@ -126,7 +126,7 @@ public:
             }
 
             buf = new_buf;
-            trace_alloc.onAlloc(buf, new_size);
+            trace_alloc.onAlloc(buf, new_size, new_size);
 
             if constexpr (clear_memory)
                 if (new_size > old_size)

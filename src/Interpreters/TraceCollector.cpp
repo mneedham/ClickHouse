@@ -1,15 +1,18 @@
 #include "TraceCollector.h"
 
 #include <Core/Field.h>
+#include <Core/UUID.h>
 #include <IO/ReadBufferFromFileDescriptor.h>
 #include <IO/ReadHelpers.h>
 #include <IO/WriteBufferFromFileDescriptor.h>
 #include <IO/WriteHelpers.h>
+#include <Interpreters/Context.h>
 #include <Interpreters/TraceLog.h>
 #include <Poco/Logger.h>
 #include <Common/ProfileEvents.h>
 #include <Common/setThreadName.h>
 #include <Common/logger_useful.h>
+#include <Common/HeapProfiler.h>
 
 
 namespace DB
@@ -43,6 +46,8 @@ void TraceCollector::tryClosePipe()
 
 TraceCollector::~TraceCollector()
 {
+    heap_profiler_dump_period_seconds.store(-1);
+
     try
     {
         /** Sends TraceCollector stop message
@@ -62,12 +67,22 @@ TraceCollector::~TraceCollector()
 
     tryClosePipe();
 
+    if (heap_profiler_task)
+        heap_profiler_task->deactivate();
+
     if (thread.joinable())
         thread.join();
     else
         LOG_ERROR(&Poco::Logger::get("TraceCollector"), "TraceCollector thread is malformed and cannot be joined");
 }
 
+
+static UInt64 currentTimeNs()
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    return static_cast<UInt64>(ts.tv_sec * 1000000000LL + ts.tv_nsec);
+}
 
 void TraceCollector::run()
 {
@@ -125,13 +140,8 @@ void TraceCollector::run()
             {
                 // time and time_in_microseconds are both being constructed from the same timespec so that the
                 // times will be equal up to the precision of a second.
-                struct timespec ts;
-                clock_gettime(CLOCK_REALTIME, &ts);
-
-                UInt64 time = static_cast<UInt64>(ts.tv_sec * 1000000000LL + ts.tv_nsec);
-                UInt64 time_in_microseconds = static_cast<UInt64>((ts.tv_sec * 1000000LL) + (ts.tv_nsec / 1000));
-
-                TraceLogElement element{time_t(time / 1000000000), time_in_microseconds, time, trace_type, thread_id, query_id, trace, size, ptr, event, increment};
+                UInt64 time = currentTimeNs();
+                TraceLogElement element{time_t(time / 1000000000), time / 1000, time, trace_type, thread_id, query_id, trace, size, ptr, event, increment, 1, std::nullopt};
                 trace_log->add(std::move(element));
             }
         }
@@ -141,6 +151,68 @@ void TraceCollector::run()
         tryClosePipe();
         throw;
     }
+}
+
+void TraceCollector::setHeapProfilerDumpPeriod(Int64 seconds)
+{
+    if (!HeapProfiler::instance().enabled())
+        return;
+
+    if (heap_profiler_dump_period_seconds.exchange(seconds) == seconds)
+        return;
+
+    if (seconds < 0)
+        return;
+
+    if (!heap_profiler_task)
+        heap_profiler_task = trace_log->getContext()->getSchedulePool().createTask(
+            "TraceCollector-heap-profiler", [this] { heapProfilerTask(); });
+
+    heap_profiler_task->scheduleAfter(size_t(seconds * 1000), /*overwrite*/ true);
+}
+
+void TraceCollector::heapProfilerTask()
+{
+    if (heap_profiler_dump_period_seconds.load() < 0)
+        return;
+
+    auto samples = HeapProfiler::instance().dump();
+    UInt64 time = currentTimeNs();
+    UUID profile_id = UUIDHelpers::generateV4();
+
+    std::vector<TraceLogElement> elements;
+    for (const auto & sample : samples)
+    {
+        if (sample.weight == 0)
+            continue;
+
+        Array trace;
+        trace.reserve(sample.stack.getSize() - sample.stack.getOffset());
+        for (size_t i = sample.stack.getOffset(); i < sample.stack.getSize(); ++i)
+            trace.emplace_back(reinterpret_cast<UInt64>(sample.stack.getFramePointers()[i]));
+
+        TraceLogElement element{
+            .event_time = time_t(time / 1000000000),
+            .event_time_microseconds = time / 1000,
+            .timestamp_ns = time,
+            .trace_type = TraceType::MemoryProfile,
+            .thread_id = sample.thread_id,
+            .query_id = std::string(sample.query_id.data(), sample.query_id_len),
+            .trace = trace,
+            .size = Int64(sample.size),
+            .ptr = UInt64(sample.ptr),
+            .event = ProfileEvents::end(),
+            .increment = 0,
+            .weight = sample.weight,
+            .profile_id = profile_id};
+        elements.emplace_back(std::move(element));
+    }
+
+    trace_log->addGroup(std::move(elements));
+
+    Int64 seconds = heap_profiler_dump_period_seconds.load();
+    if (seconds >= 0)
+        heap_profiler_task->scheduleAfter(size_t(seconds * 1000));
 }
 
 }
